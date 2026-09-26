@@ -10,6 +10,9 @@ const RAW_STDOUT_RETRY_DELAY_MS = 10;
 
 let rawStdoutWriteTail: Promise<void> = Promise.resolve();
 
+/** Set once a raw stdout write has failed, so shutdown reports it exactly once. */
+let reportedStdoutWriteFailure = false;
+
 function getRawStdoutWrite(): StdoutTakeoverState["rawStdoutWrite"] {
 	if (stdoutTakeoverState) {
 		return stdoutTakeoverState.rawStdoutWrite;
@@ -87,8 +90,29 @@ export function writeRawStdout(text: string): void {
 		return;
 	}
 	rawStdoutWriteTail = rawStdoutWriteTail.then(() => writeRawStdoutChunk(text));
-	void rawStdoutWriteTail.catch(() => {
-		process.exit(1);
+	void rawStdoutWriteTail.catch((error: unknown) => {
+		// A write failure here means the terminal went away (EPIPE, ECONNRESET,
+		// ENOTTY) — not that the session is broken. Exiting hard at this point
+		// killed the TUI with no message, no terminal restore, and no final
+		// transcript entry, so a lost window was indistinguishable from a
+		// crash. Restore the terminal and let the normal shutdown path run.
+		restoreStdout();
+		// Report only once: a dead stdout fails every subsequent write, and one
+		// shutdown line per frame would flood whatever is still listening.
+		if (reportedStdoutWriteFailure) {
+			return;
+		}
+		reportedStdoutWriteFailure = true;
+		const code = (error as { code?: unknown } | null)?.code;
+		const reason = typeof code === "string" ? code : "unknown error";
+		try {
+			process.stderr.write(
+				`pi: stdout write failed (${reason}); the terminal is gone. ` +
+					`The session transcript was saved — resume with 'pi --continue'.\n`,
+			);
+		} catch {
+			// stderr is gone too; there is nothing left to report on.
+		}
 	});
 }
 
